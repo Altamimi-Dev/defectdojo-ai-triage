@@ -1,0 +1,29 @@
+<policies>
+  <inbound>
+    <cors allow-credentials="false">
+      <allowed-origins>
+        <!-- Replace with your DefectDojo URL -->
+        <origin>http://YOUR_DEFECTDOJO_URL</origin>
+        <origin>https://YOUR_DEFECTDOJO_URL</origin>
+      </allowed-origins>
+      <allowed-methods>
+        <method>GET</method>
+        <method>POST</method>
+        <method>OPTIONS</method>
+      </allowed-methods>
+      <allowed-headers>
+        <header>*</header>
+      </allowed-headers>
+    </cors>
+    <base />
+  </inbound>
+  <backend>
+    <base />
+  </backend>
+  <outbound>
+    <base />
+  </outbound>
+  <on-error>
+    <base />
+  </on-error>
+</policies>

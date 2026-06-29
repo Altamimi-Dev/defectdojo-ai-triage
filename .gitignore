@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+pip-wheel-metadata/
+
+# Environment variables — NEVER commit credentials
+.env
+.env.*
+*.env
+local.settings.json
+
+# Azure
+.azure/
+azuredeploy.parameters.local.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Secrets / Keys — explicitly block common patterns
+*.pem
+*.key
+*.p12
+*.pfx
+*_rsa
+*_dsa
+id_rsa
+id_dsa

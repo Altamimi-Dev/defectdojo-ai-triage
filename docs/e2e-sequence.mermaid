@@ -1,0 +1,221 @@
+sequenceDiagram
+    actor Analyst as 👤 Analyst
+    participant DD as 🐛 DefectDojo UI
+    participant DJANGO as 🐍 Django Backend
+    participant APIM as 🔷 APIM
+    participant CA as 📦 Container App v23
+    participant SRCH as 🔍 Azure AI Search
+    participant AOAI as 🤖 Azure OpenAI
+    participant MCP as 🛠️ MCP Server
+    participant ADO as 📁 Azure DevOps
+    participant DDAPI as 🐛 DefectDojo API
+    participant KV as 🔑 Key Vault
+
+    rect rgb(210, 230, 255)
+        Note over Analyst,KV: ━━━━━━━━━━━━━━━━  STEP 1 · STARTUP & CONFIG  ━━━━━━━━━━━━━━━━
+    end
+
+    Note over CA: Container App starts (v23)
+    CA->>KV: GET dd-api-token
+    KV-->>CA: DefectDojo API token
+    CA->>KV: GET ado-pat-devsecops-poc
+    KV-->>CA: Azure DevOps PAT
+    CA->>CA: Init Azure OpenAI client
+    CA->>CA: Init Azure AI Search client
+    Note over CA: [CONFIG] RAG client configured<br/>[CONFIG] Azure OpenAI client active
+
+    rect rgb(210, 255, 220)
+        Note over Analyst,KV: ━━━━━━━━━━━━━━━━  STEP 2 · TRIGGER  ━━━━━━━━━━━━━━━━
+    end
+
+    Analyst->>DD: Click AI Triage button (bulk or selected)
+    DD->>DJANGO: POST /test/{id}/ai_triage_all
+    DJANGO->>APIM: POST /triage/batch {finding_ids[]}
+    Note right of DJANGO: Ocp-Apim-Subscription-Key header
+    APIM->>CA: Forward → POST /triage/batch
+    CA->>CA: Create job UUID in memory
+    CA-->>APIM: {jobId: "uuid"}
+    APIM-->>DJANGO: {jobId: "uuid"}
+    DJANGO-->>DD: Redirect with ?ai_triage_job={jobId}
+    Note over DD: Progress overlay appears<br/>Completed=0 Failed=0 Remaining=N Total=N
+
+    rect rgb(255, 248, 210)
+        Note over Analyst,KV: ━━━━━━━━━━━━━━━━  STEP 3 · LIVE PROGRESS POLLING  ━━━━━━━━━━━━━━━━
+    end
+
+    loop Every 3 seconds until job.status = done
+        DD->>APIM: GET /triage/batch/{jobId}/status
+        APIM->>CA: Forward → GET /batch/{jobId}/status
+        CA-->>DD: {completed, failed, remaining, total, status}
+        Note over DD: Stats update live<br/>Bar fills green (or orange if failures)
+    end
+
+    rect rgb(255, 235, 210)
+        Note over Analyst,KV: ━━━━━━━━━━━━━━━━  STEP 4 · PER-FINDING: FREEZE CHECK  ━━━━━━━━━━━━━━━━
+    end
+
+    Note over CA: Background thread loops over each finding_id
+    CA->>DDAPI: GET /api/v2/findings/{id}/ — check tags
+    DDAPI-->>CA: finding data + tags[]
+
+    alt Tag ANALYST_REVIEW_NEEDED found
+        Note over CA: ⛔ SKIP — finding is frozen<br/>Log: [DIRECT] skipping finding {id}
+    else No freeze tag — proceed
+        Note over CA: ✅ Continue to Step 5
+    end
+
+    rect rgb(245, 210, 255)
+        Note over Analyst,KV: ━━━━━━━━━━━━━━━━  STEP 5 · ROUTING  ━━━━━━━━━━━━━━━━
+    end
+
+    CA->>DDAPI: GET /api/v2/tests/{id}/ — get test_type
+    DDAPI-->>CA: test_type name
+
+    alt test_type = detect-secrets
+        Note over CA: → SECRETS ADAPTER path (Steps 6a–9a)
+    else test_type = semgrep / codeql / bandit / sarif
+        Note over CA: → SAST ADAPTER path (Steps 6b–9b)
+    else Unknown type
+        Note over CA: → Return 400 Error
+    end
+
+    rect rgb(255, 248, 210)
+        Note over Analyst,KV: ━━━━━━━━━━━━━━━━  STEP 6a · SECRETS ADAPTER — RAG ENRICHMENT  ━━━━━━━━━━━━━━━━
+    end
+
+    Note over CA: Build enriched finding:<br/>rule_name · file_path · line_number · severity
+
+    CA->>AOAI: POST embeddings/create<br/>input = "hardcoded credential secret {rule_name} CWE-798"
+    AOAI-->>CA: 1536-dimension query vector
+
+    CA->>SRCH: Hybrid search (vector + keyword)<br/>filter: source_id = CWE-798
+    SRCH-->>CA: Top 3 authoritative docs:
+    Note right of SRCH: [CWE-798] Hard-coded Credentials<br/>definition + mitigations<br/>[OWASP A02:2021] Cryptographic Failures<br/>[MITRE T1552] Unsecured Credentials
+    Note over CA: [RAG] Retrieved 3 docs for: hardcoded credential...
+
+    rect rgb(210, 255, 235)
+        Note over Analyst,KV: ━━━━━━━━━━━━━━━━  STEP 7a · SECRETS ADAPTER — AGENTIC LOOP  ━━━━━━━━━━━━━━━━
+    end
+
+    CA->>AOAI: POST chat/completions<br/>messages: [prompt + RAG context + finding metadata]<br/>tools: [fetch_code schema]<br/>temperature: 0
+
+    Note over AOAI: Model reads RAG context first<br/>Decides to call fetch_code
+
+    AOAI-->>CA: tool_use: fetch_code {file_path, line_number, context_lines}
+    CA->>ADO: GET file content via ADO REST API (PAT from Key Vault)
+    Note right of ADO: Read-only PAT<br/>dojo-ai-poc-repo<br/>branch: demo-manual
+    ADO-->>CA: Code snippet (secret value REDACTED on target line)
+    CA->>AOAI: tool_result: code context
+
+    Note over AOAI: Model analyses:<br/>- RAG: CWE-798 definition (what it IS)<br/>- Code: variable names, context (what it LOOKS LIKE)<br/>Produces final JSON classification
+
+    AOAI-->>CA: Final JSON response<br/>{classification, confidence, reasoning,<br/>mitigation, cwe_reference, references}
+
+    rect rgb(255, 248, 210)
+        Note over Analyst,KV: ━━━━━━━━━━━━━━━━  STEP 6b · SAST ADAPTER — RAG ENRICHMENT  ━━━━━━━━━━━━━━━━
+    end
+
+    Note over CA: Build enriched finding:<br/>rule_name · file_path · line_number · severity · finding_id
+
+    CA->>AOAI: POST embeddings/create<br/>input = "{rule_name} SAST vulnerability {severity}"
+    AOAI-->>CA: 1536-dimension query vector
+
+    CA->>SRCH: Hybrid search (vector + keyword)
+    SRCH-->>CA: Top 3 authoritative docs:
+    Note right of SRCH: e.g. SQL injection:<br/>[CWE-89] SQL Injection definition + mitigations<br/>[OWASP A03:2021] Injection risks<br/>[MITRE T1190] Exploit Public-Facing App
+
+    rect rgb(210, 255, 235)
+        Note over Analyst,KV: ━━━━━━━━━━━━━━━━  STEP 7b · SAST ADAPTER — AGENTIC LOOP  ━━━━━━━━━━━━━━━━
+    end
+
+    CA->>AOAI: POST chat/completions<br/>messages: [prompt + RAG context + finding metadata]<br/>tools: [fetch_finding, fetch_code, fetch_related_file]<br/>temperature: 0
+
+    Note over AOAI: Model reads RAG context first<br/>Tool call 1: fetch_finding
+
+    AOAI-->>CA: tool_use: fetch_finding {finding_id}
+    CA->>MCP: POST /tools/fetch_finding
+    MCP->>DDAPI: GET /api/v2/findings/{id}/
+    DDAPI-->>MCP: CWE · severity · description · data flow
+    MCP-->>CA: Finding data
+    CA->>AOAI: tool_result: full finding context
+
+    Note over AOAI: Tool call 2: fetch_code
+    AOAI-->>CA: tool_use: fetch_code {file_path, line_number}
+    CA->>MCP: POST /tools/fetch_code
+    MCP->>ADO: GET file + N context lines
+    ADO-->>MCP: Code snippet
+    MCP-->>CA: Code context
+    CA->>AOAI: tool_result: vulnerable code
+
+    Note over AOAI: Tool call 3 (optional): fetch_related_file
+    AOAI-->>CA: tool_use: fetch_related_file {file_path}
+    CA->>MCP: POST /tools/fetch_related_file
+    MCP->>ADO: GET validator / sanitizer file
+    ADO-->>MCP: File content
+    MCP-->>CA: Related file
+    CA->>AOAI: tool_result: related file content
+
+    Note over AOAI: Model analyses all context:<br/>- RAG: authoritative CWE + OWASP + MITRE<br/>- fetch_finding: full finding details<br/>- fetch_code: actual vulnerable code<br/>- fetch_related_file: sanitizer check<br/>Produces final JSON classification
+
+    AOAI-->>CA: Final JSON response<br/>{classification, confidence, reasoning,<br/>mitigation, cwe_reference, references}
+
+    rect rgb(255, 220, 220)
+        Note over Analyst,KV: ━━━━━━━━━━━━━━━━  STEP 8 · POLICY ENGINE  ━━━━━━━━━━━━━━━━
+    end
+
+    CA->>CA: policy_engine_validate(result)
+    Note over CA: Check: classification in valid set?<br/>Check: confidence ≥ 0.7?
+
+    alt Valid classification AND confidence ≥ 0.7
+        Note over CA: ✅ Pass — proceed to write-back
+    else Invalid OR confidence < 0.7
+        Note over CA: ⬇️ Downgrade to needs_review<br/>confidence kept as-is
+    end
+
+    rect rgb(210, 255, 250)
+        Note over Analyst,KV: ━━━━━━━━━━━━━━━━  STEP 9 · WRITE-BACK  ━━━━━━━━━━━━━━━━
+    end
+
+    CA->>DDAPI: PATCH /api/v2/findings/{id}/<br/>tags: [ai-{classification}]<br/>mitigation: from model<br/>references: from model
+
+    CA->>DDAPI: POST /api/v2/findings/{id}/notes/<br/>AI Triage Result note<br/>timestamp · classification · confidence<br/>reasoning · mitigation · CWE · references
+
+    alt confidence < 0.7 OR classification = needs_review
+        CA->>DDAPI: PATCH /api/v2/findings/{id}/<br/>Add tag: ANALYST_REVIEW_NEEDED
+        Note over DD: 🔍 Review button appears on finding row
+    end
+
+    Note over CA: [WRITE-BACK] finding {id} updated<br/>classification={result} confidence={score}
+    Note over DD: Progress bar updates:<br/>Completed +1
+
+    rect rgb(220, 240, 255)
+        Note over Analyst,KV: ━━━━━━━━━━━━━━━━  STEP 10 · JOB COMPLETE  ━━━━━━━━━━━━━━━━
+    end
+
+    Note over CA: All findings processed<br/>job.status = done
+    DD->>APIM: GET /triage/batch/{jobId}/status
+    CA-->>DD: {status: done, completed: N, failed: X}
+    Note over DD: Bar → 100% green (or orange if failures)<br/>"Done! N completed. Reloading..."
+    DD-->>Analyst: Page reloads — findings show AI tags
+
+    rect rgb(220, 255, 240)
+        Note over Analyst,KV: ━━━━━━━━━━━━━━━━  STEP 11 · ANALYST REVIEW (if flagged)  ━━━━━━━━━━━━━━━━
+    end
+
+    Analyst->>DD: Click Review button on ANALYST_REVIEW_NEEDED finding
+    DD-->>Analyst: Modal: Approve / Override / Notes / Spinner
+    Analyst->>APIM: POST /triage/analyst/review<br/>{finding_id, decision, override_status, notes}
+    APIM->>CA: Forward → POST /analyst/review
+
+    CA->>DDAPI: POST /api/v2/findings/{id}/notes/<br/>[APPROVED] or [OVERRIDDEN]<br/>reviewer · timestamp · notes
+
+    alt decision = override
+        CA->>DDAPI: PATCH /api/v2/findings/{id}/<br/>false_p / risk_accepted / active
+    end
+
+    CA->>DDAPI: GET /api/v2/findings/{id}/ — fetch current tags
+    DDAPI-->>CA: existing tags[]
+    CA->>DDAPI: PATCH /api/v2/findings/{id}/<br/>Remove: ANALYST_REVIEW_NEEDED<br/>Add: ANALYST_REVIEWED<br/>All other tags preserved
+
+    CA-->>DD: {status: ok}
+    DD-->>Analyst: Page reloads<br/>Finding shows ANALYST_REVIEWED tag<br/>Decision note in Notes tab

@@ -1,0 +1,200 @@
+flowchart TD
+
+    %% ─── TRIGGERS ───────────────────────────────────────────────────────────
+    subgraph TRIGGERS["🖱️ Trigger Sources"]
+        BTN["AI Triage Button\nBulk or Selected findings"]
+        SINGLE["Single Finding\nPOST /triage/{finding_id}"]
+        SCHED["Scheduler 10PM Daily\n⚠️ Not built yet"]
+    end
+
+    %% ─── DEFECTDOJO UI ───────────────────────────────────────────────────────
+    subgraph DOJO_UI["🐛 DefectDojo UI  ·  35.202.90.152:8080"]
+        TEST_PAGE["Test Page\nview_test.html"]
+        OVERLAY["Progress Overlay\n✅ Completed  ❌ Failed\n🟠 Remaining  🔵 Total\nPolls every 3s · Retries 15x"]
+        AR_BTN["Analyst Review Queue\nMenu item · Inline Review button\nShown only when ANALYST_REVIEW_NEEDED"]
+        AR_MODAL["Analyst Review Modal\nApprove  ·  Override\nOverride status dropdown\nNotes textarea  ·  Spinner on submit"]
+    end
+
+    %% ─── APIM ────────────────────────────────────────────────────────────────
+    subgraph APIM["🔷 Azure API Management\napim-khan-triage-demo.azure-api.net\nCORS: 35.202.90.152:8080\nAuth: Ocp-Apim-Subscription-Key"]
+        A1["POST /triage/batch"]
+        A2["POST /triage/{finding_id}"]
+        A3["GET /triage/batch/{jobId}/status"]
+        A4["POST /triage/analyst/review"]
+    end
+
+    %% ─── CONTAINER APP ──────────────────────────────────────────────────────
+    subgraph CA["📦 Container App  ·  v22  ·  1 replica\nca-khan-triage-demo  ·  FastAPI + Uvicorn"]
+
+        subgraph BATCH["Batch Engine"]
+            B1["POST /triage/batch\nCreate job UUID in memory\nSpawn background thread\nReturn jobId immediately"]
+            B2["_run_batch_job\nLoop over finding IDs\nUpdate job stats live"]
+            B3["GET /batch/{job_id}/status\nReturn completed / failed\nremaining / total / status"]
+        end
+
+        subgraph FREEZE["🔒 Freeze Guard"]
+            F1["is_pending_analyst_review\nGET finding from DefectDojo\nCheck for ANALYST_REVIEW_NEEDED tag"]
+            F2["SKIP\nReturn skipped status\nFinding frozen until analyst acts"]
+        end
+
+        subgraph ROUTER["🔀 Router  ·  process_finding_directly"]
+            R1["fetch_finding\nGET /api/v2/findings/{id}"]
+            R2["get_test_type_name\nGET /api/v2/tests/{id}"]
+            R3{"Route by\ntest_type"}
+            R4["detect-secrets\n→ secrets_adapter"]
+            R5["semgrep · codeql\nbandit · sarif\nsonarqube · checkmarx\n→ sast_adapter"]
+            R6["Unknown type\n→ 400 Error"]
+        end
+
+        subgraph SECRETS["🔐 Secrets Adapter"]
+            S1["Build enriched finding\nrule_name · file_path\nline_number · severity"]
+            S2["SECRETS_PROMPT_TEMPLATE\nInstructs model to fetch\ncode before classifying"]
+            S3["call_model\nAgentic loop\nMAX_AGENT_TOOL_CALLS = 4"]
+            S4["Tool: fetch_code\nfetch_code_from_repo\nDirect ADO REST call\nSecret value REDACTED"]
+        end
+
+        subgraph SAST["🔍 SAST Adapter"]
+            T1["sast_adapter\nBuild enriched finding\nIncluding finding_id"]
+            T2["SAST_PROMPT_TEMPLATE\nStep 1: fetch_finding\nStep 2: fetch_code\nStep 3: fetch_related_file optional"]
+            T3["call_model_sast\nAgentic loop\nMAX_AGENT_TOOL_CALLS = 4"]
+            T4["call_mcp_tool\nHTTP POST to MCP Server\n/tools/{tool_name}"]
+        end
+
+        subgraph POLICY["⚙️ Policy Engine"]
+            P1["policy_engine_validate\nCheck classification is valid\ntrue_positive · false_positive\nneeds_review"]
+            P2{"confidence\n≥ 0.7?"}
+            P3["Downgrade to needs_review\nconfidence kept as-is\nclassification overridden"]
+        end
+
+        subgraph WRITEBACK["📝 Write-back"]
+            W1{"should_flag_for_review\nconfidence < 0.7\nOR needs_review?"}
+            W2["PATCH /api/v2/findings/{id}\ntags: ai-{classification}\nmitigation · references"]
+            W3["POST /api/v2/findings/{id}/notes\nAI Triage Result note\nTimestamp · classification\nconfidence · reasoning\nmitigation · CWE · references"]
+            W4["flag_for_analyst_review\nAdd ANALYST_REVIEW_NEEDED tag\nLog reason: low confidence\nor needs_review"]
+        end
+
+        subgraph AR_EP["👤 Analyst Review Endpoint"]
+            AR1["POST /analyst/review\nAnalystReviewPayload\nfinding_id · decision\noverride_status · notes\nanalyst_user"]
+            AR2["Write decision note\nPOST /api/v2/findings/{id}/notes\nAPPROVED or OVERRIDDEN\nReviewer · timestamp · notes"]
+            AR3{"decision =\noverride?"}
+            AR4["Update finding status\nPATCH /api/v2/findings/{id}\nfalse_p · risk_accepted\nor active"]
+            AR5["swap_analyst_tags\nGET existing tags\nRemove ANALYST_REVIEW_NEEDED\nAdd ANALYST_REVIEWED\nPATCH full tag list\nAll other tags preserved"]
+        end
+
+    end
+
+    %% ─── MCP SERVER ──────────────────────────────────────────────────────────
+    subgraph MCP["🛠️ MCP Server  ·  Internal Ingress Only\nca-khan-mcp-server\nManaged Identity → Key Vault"]
+        M1["POST /tools/fetch_finding\nGET DefectDojo finding\nCWE · severity · description\nSAST data flow"]
+        M2["POST /tools/fetch_code\nADO REST API\nFile + N lines of context\naround flagged line\nSecret value REDACTED"]
+        M3["POST /tools/fetch_related_file\nADO REST API\nAny file model decides\nit needs to verify"]
+    end
+
+    %% ─── AZURE OPENAI ────────────────────────────────────────────────────────
+    subgraph AOAI["🤖 Azure OpenAI\naoi-khan-triage-demo\nDeployment: gpt-4o-triage\ntemperature = 0"]
+        MODEL["gpt-4o-triage\nTool calling: auto\nJSON mode on final turn\nResponds in structured JSON"]
+    end
+
+    %% ─── EXTERNAL SERVICES ───────────────────────────────────────────────────
+    subgraph EXT["External Services"]
+        ADO["📁 Azure DevOps\ndojo-ai-poc-repo\nbranch: demo-manual\nRead-only PAT"]
+        KV["🔑 Key Vault\nkv-khan-triage-demo\ndd-api-token\nado-pat-devsecops-poc"]
+        DD_API["🐛 DefectDojo API\n/api/v2/findings\n/api/v2/tests\n/api/v2/findings/{id}/notes"]
+    end
+
+    %% ─── CONNECTIONS ─────────────────────────────────────────────────────────
+
+    BTN --> TEST_PAGE
+    TEST_PAGE -->|"POST /test/{id}/ai_triage_all"| A1
+    SINGLE --> A2
+    TEST_PAGE -->|"poll every 3s"| A3
+    A3 --> B3
+    B3 -->|"job stats"| OVERLAY
+
+    A1 --> B1
+    B1 -->|"background thread"| B2
+    B2 -->|"each finding_id"| F1
+    A2 --> F1
+
+    F1 -->|"tag found"| F2
+    F1 -->|"no tag"| R1
+
+    R1 --> R2
+    R2 --> R3
+    R3 -->|"detect-secrets"| R4
+    R3 -->|"semgrep / codeql\nbandit / sarif"| R5
+    R3 -->|"unknown"| R6
+
+    R4 --> S1
+    S1 --> S2
+    S2 --> S3
+    S3 -->|"tool_use: fetch_code"| S4
+    S4 -->|"ADO REST API"| ADO
+    ADO -->|"code snippet"| S4
+    S4 -->|"tool result"| S3
+    S3 -->|"API call"| MODEL
+    MODEL -->|"response"| S3
+
+    R5 --> T1
+    T1 --> T2
+    T2 --> T3
+    T3 -->|"HTTP POST"| T4
+    T4 -->|"POST /tools/fetch_finding"| M1
+    T4 -->|"POST /tools/fetch_code"| M2
+    T4 -->|"POST /tools/fetch_related_file"| M3
+    M1 -->|"DD API call"| DD_API
+    M2 -->|"ADO API call"| ADO
+    M3 -->|"ADO API call"| ADO
+    M1 -->|"finding data"| T4
+    M2 -->|"code snippet"| T4
+    M3 -->|"file content"| T4
+    T4 -->|"tool result"| T3
+    T3 -->|"API call"| MODEL
+    MODEL -->|"response"| T3
+
+    S3 -->|"raw JSON result"| P1
+    T3 -->|"raw JSON result"| P1
+    P1 --> P2
+    P2 -->|"yes"| W1
+    P2 -->|"no"| P3
+    P3 --> W1
+
+    W1 -->|"PATCH finding"| W2
+    W1 -->|"POST note"| W3
+    W2 -->|"REST API"| DD_API
+    W3 -->|"REST API"| DD_API
+    W1 -->|"yes: flag it"| W4
+    W4 -->|"add tag"| DD_API
+
+    AR_BTN --> AR_MODAL
+    AR_MODAL -->|"Submit"| A4
+    A4 --> AR1
+    AR1 --> AR2
+    AR2 -->|"REST API"| DD_API
+    AR1 --> AR3
+    AR3 -->|"yes"| AR4
+    AR4 -->|"REST API"| DD_API
+    AR3 -->|"no"| AR5
+    AR4 --> AR5
+    AR5 -->|"REST API"| DD_API
+    AR5 -->|"page reloads"| DOJO_UI
+
+    MCP -->|"Managed Identity"| KV
+    KV -->|"secrets"| MCP
+
+    %% ─── STYLES ──────────────────────────────────────────────────────────────
+    classDef azureBlue fill:#0078D4,stroke:#005A9E,color:#fff,font-size:11px
+    classDef green fill:#107C10,stroke:#0B5E0B,color:#fff,font-size:11px
+    classDef orange fill:#E67E22,stroke:#CA6F1E,color:#fff,font-size:11px
+    classDef red fill:#C0392B,stroke:#96281B,color:#fff,font-size:11px
+    classDef teal fill:#16A085,stroke:#0E6655,color:#fff,font-size:11px
+    classDef purple fill:#7D3C98,stroke:#6C3483,color:#fff,font-size:11px
+    classDef gray fill:#5D6D7E,stroke:#4A5568,color:#fff,font-size:11px
+
+    class A1,A2,A3,A4 azureBlue
+    class S3,T3,MODEL green
+    class M1,M2,M3,T4,S4 orange
+    class F1,F2,W4 red
+    class AR1,AR2,AR3,AR4,AR5 teal
+    class P1,P2,P3 purple
+    class R3 gray

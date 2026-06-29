@@ -1,0 +1,80 @@
+name: Build and Deploy
+
+# Runs on every push to main branch
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:   # Also allows manual trigger from GitHub UI
+
+# ── REQUIRED GITHUB SECRETS ────────────────────────────────────────────────────
+# Set these in: GitHub repo → Settings → Secrets and variables → Actions
+#
+#   AZURE_CREDENTIALS         - Service principal JSON (see docs/github-setup.md)
+#   AZURE_RESOURCE_GROUP      - e.g. rg-ai-triage
+#   ACR_LOGIN_SERVER          - e.g. acrmyorgtriage.azurecr.io
+#   TRIAGE_APP_NAME           - e.g. ca-myorg-triage
+#   MCP_APP_NAME              - e.g. ca-myorg-mcp
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    name: Build images and update Container Apps
+
+    steps:
+      # ── 1. Checkout code ──────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Log in to Azure ────────────────────────────────────────────────────
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # ── 3. Log in to Container Registry ──────────────────────────────────────
+      - name: ACR Login
+        run: az acr login --name ${{ secrets.ACR_LOGIN_SERVER }}
+
+      # ── 4. Build and push triage-app ──────────────────────────────────────────
+      - name: Build triage-app
+        run: |
+          az acr build \
+            --registry ${{ secrets.ACR_LOGIN_SERVER }} \
+            --image triage-app:${{ github.sha }} \
+            --image triage-app:latest \
+            ./triage-app
+
+      # ── 5. Build and push mcp-server ──────────────────────────────────────────
+      - name: Build mcp-server
+        run: |
+          az acr build \
+            --registry ${{ secrets.ACR_LOGIN_SERVER }} \
+            --image mcp-server:${{ github.sha }} \
+            --image mcp-server:latest \
+            ./mcp-server
+
+      # ── 6. Deploy triage-app ──────────────────────────────────────────────────
+      - name: Deploy triage-app
+        uses: azure/container-apps-deploy-action@v1
+        with:
+          containerAppName: ${{ secrets.TRIAGE_APP_NAME }}
+          resourceGroup: ${{ secrets.AZURE_RESOURCE_GROUP }}
+          imageToDeploy: ${{ secrets.ACR_LOGIN_SERVER }}/triage-app:${{ github.sha }}
+
+      # ── 7. Deploy mcp-server ──────────────────────────────────────────────────
+      - name: Deploy mcp-server
+        uses: azure/container-apps-deploy-action@v1
+        with:
+          containerAppName: ${{ secrets.MCP_APP_NAME }}
+          resourceGroup: ${{ secrets.AZURE_RESOURCE_GROUP }}
+          imageToDeploy: ${{ secrets.ACR_LOGIN_SERVER }}/mcp-server:${{ github.sha }}
+
+      # ── 8. Verify deployment ──────────────────────────────────────────────────
+      - name: Verify deployment
+        run: |
+          FQDN=$(az containerapp show \
+            --name ${{ secrets.TRIAGE_APP_NAME }} \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+          echo "Triage App deployed at: https://$FQDN"
+          curl -sf "https://$FQDN/" | python3 -c "import sys,json; d=json.load(sys.stdin); print('Health:', d['status'])"

@@ -1,0 +1,129 @@
+sequenceDiagram
+    actor Analyst as 👤 Analyst
+    participant DD as 🐛 DefectDojo UI
+    participant APIM as 🔷 APIM
+    participant CA as 📦 Container App
+    participant SRCH as 🔍 Azure AI Search
+    participant AOAI as 🤖 Azure OpenAI
+    participant MCP as 🛠️ MCP Server
+    participant ADO as 📁 Azure DevOps
+    participant DDAPI as 🐛 DefectDojo API
+
+    rect rgb(220, 235, 255)
+        Note over Analyst,DDAPI: ━━━━━━━━━━━━━━━━━━━━━━━━  DETECT-SECRETS FLOW  ━━━━━━━━━━━━━━━━━━━━━━━━
+    end
+
+    Analyst->>DD: 1. Click AI Triage
+    DD->>APIM: POST /triage/batch
+    APIM->>CA: Forward request
+    CA-->>DD: Return jobId
+
+    rect rgb(255, 245, 220)
+        Note over CA,SRCH: STEP 2 — RAG fires BEFORE model sees anything
+        CA->>SRCH: Hybrid search (vector + keyword)
+        Note right of CA: query = "hardcoded credential<br/>secret {rule_name} CWE-798"
+        SRCH-->>CA: Top 3 docs returned:
+        Note right of SRCH: [CWE-798] Hard-coded Credentials<br/>[OWASP A02:2021] Cryptographic Failures<br/>[MITRE T1552] Unsecured Credentials
+    end
+
+    rect rgb(235, 255, 235)
+        Note over CA,AOAI: STEP 3 — RAG context injected into prompt
+        CA->>AOAI: Send prompt WITH RAG context
+        Note right of CA: === AUTHORITATIVE SECURITY KNOWLEDGE ===<br/>[CWE-798] definition + mitigations<br/>[OWASP A02] context<br/>[MITRE T1552] attack pattern<br/>=== END SECURITY KNOWLEDGE ===<br/>+ finding metadata
+    end
+
+    rect rgb(245, 235, 255)
+        Note over AOAI,ADO: STEP 4 — Model calls fetch_code tool
+        AOAI->>CA: tool_use: fetch_code {file_path, line_number}
+        CA->>ADO: GET file via ADO REST API
+        ADO-->>CA: Code snippet (secret value REDACTED)
+        CA->>AOAI: tool_result: code context
+    end
+
+    rect rgb(235, 255, 245)
+        Note over AOAI,CA: STEP 5 — Model classifies with full context
+        AOAI-->>CA: Final JSON response
+        Note right of AOAI: classification: true_positive / false_positive / needs_review<br/>confidence: 0.0 - 1.0<br/>reasoning: anchored to RAG knowledge<br/>mitigation: from CWE-798 knowledge base<br/>cwe_reference: CWE-798<br/>references: OWASP mapping
+    end
+
+    rect rgb(255, 235, 235)
+        Note over CA,DDAPI: STEP 6 — Policy Engine + Write-back
+        CA->>CA: Policy Engine validate (confidence ≥ 0.7?)
+        CA->>DDAPI: PATCH finding — tags + mitigation + references
+        CA->>DDAPI: POST note — full AI triage result + timestamp
+        alt confidence < 0.7 OR needs_review
+            CA->>DDAPI: Add tag ANALYST_REVIEW_NEEDED
+            Note over DD: Review button appears on finding
+        end
+    end
+
+    rect rgb(220, 235, 255)
+        Note over Analyst,DDAPI: ━━━━━━━━━━━━━━━━━━━━━━━━  SAST FLOW (Semgrep / CodeQL / Bandit)  ━━━━━━━━━━━━━━━━━━━━━━━━
+    end
+
+    Analyst->>DD: 1. Click AI Triage
+    DD->>APIM: POST /triage/batch
+    APIM->>CA: Forward request
+    CA-->>DD: Return jobId
+
+    rect rgb(255, 245, 220)
+        Note over CA,SRCH: STEP 2 — RAG fires BEFORE model sees anything
+        CA->>SRCH: Hybrid search (vector + keyword)
+        Note right of CA: query = "{rule_name} SAST<br/>vulnerability {severity}"
+        SRCH-->>CA: Top 3 docs returned
+        Note right of SRCH: e.g. SQL injection finding:<br/>[CWE-89] SQL Injection<br/>[OWASP A03:2021] Injection<br/>[MITRE T1190] Exploit Public-Facing App
+    end
+
+    rect rgb(235, 255, 235)
+        Note over CA,AOAI: STEP 3 — RAG context injected into prompt
+        CA->>AOAI: Send prompt WITH RAG context
+        Note right of CA: === AUTHORITATIVE SECURITY KNOWLEDGE ===<br/>[CWE-89] definition + mitigations<br/>[OWASP A03] injection context<br/>[MITRE T1190] attack pattern<br/>=== END SECURITY KNOWLEDGE ===<br/>+ finding metadata
+    end
+
+    rect rgb(245, 235, 255)
+        Note over AOAI,DDAPI: STEP 4 — Model calls MCP tools in sequence
+        AOAI->>CA: tool_use: fetch_finding {finding_id}
+        CA->>MCP: POST /tools/fetch_finding
+        MCP->>DDAPI: GET finding — CWE, severity, description
+        DDAPI-->>MCP: Full finding data
+        MCP-->>CA: Finding context
+        CA->>AOAI: tool_result: finding data
+
+        AOAI->>CA: tool_use: fetch_code {file_path, line_number}
+        CA->>MCP: POST /tools/fetch_code
+        MCP->>ADO: GET file + context lines
+        ADO-->>MCP: Code snippet
+        MCP-->>CA: Code context
+        CA->>AOAI: tool_result: code snippet
+
+        Note over AOAI: Optional — if sanitizer referenced
+        AOAI->>CA: tool_use: fetch_related_file {file_path}
+        CA->>MCP: POST /tools/fetch_related_file
+        MCP->>ADO: GET related file
+        ADO-->>MCP: File content
+        MCP-->>CA: File content
+        CA->>AOAI: tool_result: related file
+    end
+
+    rect rgb(235, 255, 245)
+        Note over AOAI,CA: STEP 5 — Model classifies with full context
+        AOAI-->>CA: Final JSON response
+        Note right of AOAI: classification: true_positive / false_positive / needs_review<br/>confidence: 0.0 - 1.0<br/>reasoning: anchored to RAG + code evidence<br/>mitigation: from CWE knowledge base + code-specific fix<br/>cwe_reference: precise CWE mapping<br/>references: OWASP + Semgrep rule link
+    end
+
+    rect rgb(255, 235, 235)
+        Note over CA,DDAPI: STEP 6 — Policy Engine + Write-back
+        CA->>CA: Policy Engine validate (confidence ≥ 0.7?)
+        CA->>DDAPI: PATCH finding — tags + mitigation + references
+        CA->>DDAPI: POST note — full AI triage result + timestamp
+        alt confidence < 0.7 OR needs_review
+            CA->>DDAPI: Add tag ANALYST_REVIEW_NEEDED
+            Note over DD: Review button appears on finding
+        end
+    end
+
+    rect rgb(220, 255, 220)
+        Note over Analyst,DDAPI: ━━━━━━━━━━━━━━━━━━━━━━━━  KEY DIFFERENCE RAG MAKES  ━━━━━━━━━━━━━━━━━━━━━━━━
+        Note over CA,AOAI: WITHOUT RAG: model relies on training memory → inconsistent CWE mapping, generic mitigations, confidence varies
+        Note over CA,SRCH: WITH RAG: authoritative definitions injected at query time → precise CWE/OWASP/MITRE mapping, specific mitigations, consistent results
+    end

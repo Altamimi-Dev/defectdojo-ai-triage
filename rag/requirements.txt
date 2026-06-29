@@ -1,0 +1,5 @@
+azure-search-documents
+azure-identity
+azure-keyvault-secrets
+openai
+requests
