@@ -22,6 +22,26 @@ DefectDojo AI Triage is a production-ready pipeline that **automatically triages
 
 ---
 
+## Screenshots
+
+### AI Triage in Progress
+![AI Triage Progress](screenshots/triage-progress.png)
+*Live progress overlay showing completed, failed, remaining and total findings*
+
+### Finding with AI Triage Result
+![AI Triage Result](screenshots/finding-triage-result.png)
+*Finding tagged with AI classification and detailed triage note written back*
+
+### Analyst Review Modal
+![Analyst Review](screenshots/analyst-review-modal.png)
+*Analyst Review modal — approve or override the AI decision*
+
+### Findings List with AI Tags
+![Findings List](screenshots/findings-list-tags.png)
+*Findings list showing ai-true_positive, ai-false_positive and ANALYST_REVIEW_NEEDED tags*
+
+---
+
 ## Architecture
 
 ```
@@ -46,14 +66,90 @@ DefectDojo  ──────────────────► API Manage
 
 See [`docs/e2e-sequence.mermaid`](docs/e2e-sequence.mermaid) for the full end-to-end sequence diagram.
 
+### MCP Server Tools
+
+| Tool | Description |
+|---|---|
+| `fetch_finding` | Fetch full finding from DefectDojo (CWE, severity, description) |
+| `fetch_code` | Fetch source file from ADO with context around flagged line |
+| `fetch_related_file` | Fetch any related file (sanitizers, validators, upstream callers) |
+| `fetch_epss` | **Live** — query FIRST.org API for CVE exploitation probability (0-1, next 30 days) |
+
+### End-to-End Flow
+
+```mermaid
+sequenceDiagram
+    actor Analyst as Analyst
+    participant DD as DefectDojo UI
+    participant APIM as API Management
+    participant CA as Container App
+    participant SRCH as Azure AI Search
+    participant AOAI as Azure OpenAI
+    participant MCP as MCP Server
+    participant ADO as Azure DevOps
+    participant DDAPI as DefectDojo API
+
+    Analyst->>DD: 1. Click AI Triage
+    DD->>APIM: POST /triage/batch
+    APIM->>CA: Forward request
+    CA-->>DD: Return jobId
+
+    loop Poll every 3s
+        DD->>APIM: GET /batch/{jobId}/status
+        CA-->>DD: completed / failed / remaining / total
+    end
+
+    Note over CA: Freeze check — skip ANALYST_REVIEW_NEEDED findings
+
+    CA->>SRCH: 2. RAG query — embed + hybrid search
+    SRCH-->>CA: Top 3 docs (CWE + OWASP + MITRE)
+
+    CA->>AOAI: 3. Prompt + RAG context + tools
+    AOAI->>ADO: fetch_code (secrets) or via MCP (SAST)
+    ADO-->>AOAI: Code snippet
+    AOAI-->>CA: JSON classification
+
+    CA->>CA: 4. Policy Engine — validate + confidence check
+    CA->>DDAPI: 5. Write-back — tags + note
+    alt confidence < 0.7
+        CA->>DDAPI: Add ANALYST_REVIEW_NEEDED tag
+    end
+
+    Analyst->>DD: 6. Click Review button
+    Analyst->>APIM: POST /analyst/review
+    CA->>DDAPI: Write decision note + swap tags
+```
+
+### RAG Enrichment Flow
+
+```mermaid
+flowchart TD
+    A[Finding arrives] --> B[Generate embedding
+via Azure OpenAI]
+    B --> C[Hybrid search
+Azure AI Search]
+    C --> D{Results found?}
+    D -->|Yes| E[Top 3 docs returned
+CWE + OWASP + MITRE]
+    D -->|No| F[Proceed without RAG]
+    E --> G[Inject into prompt
+=== AUTHORITATIVE KNOWLEDGE ===]
+    G --> H[Model triages with
+authoritative context]
+    F --> H
+    H --> I[Consistent CWE mapping
+Precise mitigations
+OWASP + MITRE references]
+```
+
 ---
 
 ## Supported Adapters
 
 | Adapter | Supported Test Types | Status |
 |---|---|---|
-| **Secrets** | `detect-secrets` | ✅ Production ready |
-| **SAST** | `semgrep`, `codeql`, `bandit`, `sarif`, `sonarqube`, `checkmarx` | ✅ Production ready |
+| **Secrets** | `detect-secrets` | ✅ Production ready + RAG (CWE/KEV/MITRE) |
+| **SAST** | `semgrep`, `codeql`, `bandit`, `sarif`, `sonarqube`, `checkmarx` | ✅ Production ready + RAG + EPSS |
 | **SCA** | `dependabot`, `owasp-dependency-check` | 🔲 Stub — PRs welcome |
 | **DAST** | `zap`, `burp` | 🔲 Stub — PRs welcome |
 | **IaC** | `checkov`, `tfsec` | 🔲 Stub — PRs welcome |
@@ -67,10 +163,13 @@ Every finding is enriched with authoritative security knowledge before the model
 | Source | Coverage | Documents |
 |---|---|---|
 | **CWE** | Top 15 most common weaknesses | CWE-89, CWE-79, CWE-798, CWE-22, CWE-78, and more |
-| **OWASP Top 10 2021** | All 10 categories | A01–A10 definitions + mitigations |
+| **KEV** | CISA Known Exploited Vulnerabilities | 60 actively exploited CVEs fetched live from CISA |
 | **MITRE ATT&CK** | AppSec-relevant techniques | T1190, T1552, T1059, T1078, T1110, T1530, T1071 |
-| **NVD CVE** | Live API | Planned — PRs welcome |
+| **EPSS** | Live exploitation probability | Queried live via FIRST.org API per CVE at triage time |
+| **CSAF** | Vendor security advisories | Planned — PRs welcome |
 | **Internal standards** | Your org's policies | Add your own via `rag/ingest.py` |
+
+> **Why KEV instead of OWASP Top 10?** Based on community feedback from Danijel Milicevic (Head of Security & Quality Engineering @ DB InfraGO): *"OWASP Top 10 is a catch-all — good luck finding CVEs that don't map to Top 10. KEV is the right signal source."* OWASP A03 Injection alone maps to 50+ CWEs and adds noise rather than signal. KEV provides much higher fidelity since these are CVEs **actively being exploited right now** in the wild.
 
 ---
 
@@ -377,4 +476,3 @@ MIT — see [LICENSE](LICENSE).
 
 Built by a Senior Enterprise Security Architect.
 Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
-
