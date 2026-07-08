@@ -584,9 +584,13 @@ Step 1 — Call fetch_finding to get the full description and CWE.
 Step 2 — Call fetch_code to see the vulnerable code and surrounding context.
 Step 3 — If the code references a sanitizer, validator, or helper function that
           might neutralize the vulnerability, call fetch_related_file to verify.
-Step 4 — If a CVE ID is present in the finding, call fetch_epss to get the
-          live exploitation probability. A high EPSS score (>0.5) should
-          increase your confidence in true_positive classification.
+Step 4 — After fetch_finding, check the result for any CVE ID in these fields:
+          - cve field directly
+          - vuln_id field (may contain CVE-XXXX-XXXXX format)
+          - description or references fields (look for CVE-XXXX-XXXXX pattern)
+          If ANY CVE ID is found, you MUST call fetch_epss with that CVE ID.
+          A high EPSS score (>0.5) should increase your confidence in true_positive.
+          Include the epss_score and epss_percentile in your final JSON response.
 Step 5 — Call analyze_reachability with the file_path and line_number to
           determine if the vulnerable code is reachable from HTTP entry points.
           If is_reachable=False (dead code) → classify as false_positive with high confidence.
@@ -595,8 +599,12 @@ Step 5 — Call analyze_reachability with the file_path and line_number to
 Step 6 — Classify as one of: true_positive / false_positive / needs_review.
 
 Respond ONLY with valid JSON:
-{{"classification": "...", "confidence": 0.0-1.0, "reasoning": "...", "mitigation": "...", "cwe_reference": "CWE-XXX", "references": "...", "epss_score": null_or_float, "epss_percentile": null_or_float}}
+{{"classification": "...", "confidence": 0.0-1.0, "reasoning": "...", "mitigation": "...", "cwe_reference": "CWE-XXX", "references": "...", "epss_score": null_or_float, "epss_percentile": null_or_float, "steps_to_reproduce": "..."}}
 If you called fetch_epss, populate epss_score and epss_percentile from the result. Otherwise set both to null.
+For steps_to_reproduce:
+- If analyze_reachability returned is_reachable=False: explain that the function is unreachable, name the function, state no callers were found, conclude finding cannot be reproduced.
+- If analyze_reachability returned is_reachable=True: provide the exact call path from HTTP entry point to vulnerable function as numbered reproduction steps.
+- If analyze_reachability was not called or returned None: describe the theoretical reproduction path based on the code context.
 """
 
 def call_mcp_tool(tool_name: str, args: dict) -> dict:
@@ -948,6 +956,9 @@ def write_back_to_dd(finding_id: int, result: dict) -> None:
         log.info(f"[WRITE-BACK] writing EPSS score {result['epss_score']} to finding {finding_id}")
     if result.get("epss_percentile") is not None:
         patch_payload["epss_percentile"] = result["epss_percentile"]
+    if result.get("steps_to_reproduce"):
+        patch_payload["steps_to_reproduce"] = result["steps_to_reproduce"]
+        log.info(f"[WRITE-BACK] writing steps_to_reproduce to finding {finding_id}")
     requests.patch(
         f"{DD_BASE_URL}/api/v2/findings/{finding_id}/",
         headers=DD_HEADERS_JSON,
